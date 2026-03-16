@@ -1,0 +1,25 @@
+Library,Approach,# of reported TCs,API,Link to the issue report,Current state (2025/06/12),Note
+tf,API Document RAG,1,tf.boolean_mask,https://github.com/tensorflow/tensorflow/issues/89106,Confirmed bug,"two TCs revealing the same bug, so, we just reported one here."
+tf,API Document RAG,1,tf.convert_to_tensor,https://github.com/tensorflow/tensorflow/issues/89107,Not bug,
+tf,API Document RAG,1,tf.train.ClusterSpec,https://github.com/tensorflow/tensorflow/issues/89118,Confirmed bug,
+tf,API Document RAG,1,tf.keras.layers.Conv2DTranspose,https://github.com/tensorflow/tensorflow/issues/89244,Open,
+tf,API Document RAG,1,tf.keras.losses.BinaryCrossentropy,https://github.com/tensorflow/tensorflow/issues/89245,Flaky,
+tf,API Document RAG,1,tf.keras.losses.SparseCategoricalCrossentropy,https://github.com/keras-team/tf-keras/issues/847,Not bug,
+tf,API Document RAG,2,tf.no_op,https://github.com/tensorflow/tensorflow/issues/89248,Open,
+tf,API Document RAG,1,tf.ones_like,https://github.com/tensorflow/tensorflow/issues/89250,Open,
+tf,Basic Instruction Prompting,1,tf.keras.layers.InputLayer,https://github.com/keras-team/tf-keras/issues/848,Open,
+torch,Both,1,torch.equal ,https://github.com/pytorch/pytorch/issues/149222,Confirmed as Doc Error,"both API doc and basic instruction prompting generated TC that reveals same bug, so, we just reported one here."
+torch,API Document RAG,1,torch.jit.script,https://github.com/pytorch/pytorch/issues/149223,Open,
+torch,API Document RAG,1,torch.save,https://github.com/pytorch/pytorch/issues/149224,Open,
+torch,Basic Instruction Prompting,1,torch.all_close,https://github.com/pytorch/pytorch/issues/149225,Not bug,
+torch,Basic Instruction Prompting,2,torch.nn.utils.rnn.pack_padded_sequence,https://github.com/pytorch/pytorch/issues/149227,Open,
+sklearn,Both,1,sklearn.model_selection.RepeatedKFold,https://github.com/scikit-learn/scikit-learn/issues/31743,Open,"both API doc and basic instruction prompting generated TC that reveals same bug, so, we just reported one here."
+sklearn,API Document RAG,1,sklearn.cluster.KMeans,https://github.com/scikit-learn/scikit-learn/issues/31744,Open,
+sklearn,API Document RAG,1,sklearn.decomposition.TruncatedSVD,https://github.com/scikit-learn/scikit-learn/issues/31745,Open,
+sklearn,API Document RAG,0,sklearn.linear_model.ElasticNet,https://github.com/scikit-learn/scikit-learn/issues/17814,not reported,found a similar issue. thus we skipped reporting
+sklearn,API Document RAG,1,sklearn.preprocessing.PolynomialFeatures,https://github.com/scikit-learn/scikit-learn/issues/31746,Open,
+sklearn,Basic Instruction Prompting,1,sklearn.feature_selection.SelectKBest,https://github.com/scikit-learn/scikit-learn/issues/31747,Open,
+sklearn,Basic Instruction Prompting,1,sklearn.linear_model.Lasso,https://github.com/scikit-learn/scikit-learn/issues/31748,Open,
+sklearn,Basic Instruction Prompting,1,sklearn.utils.validation.column_or_1d,https://github.com/scikit-learn/scikit-learn/issues/31749,Not bug,
+xgb,API Document RAG,1,xgboost.dask.DaskXGBRanker.predict,https://github.com/dmlc/xgboost/issues/11558,Open,
+total,,24,,,,
