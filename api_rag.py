@@ -3,6 +3,8 @@ from openai import OpenAI
 import openai
 import chromadb
 from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.cluster import KMeans
 import json
 import os
 import sys
@@ -173,6 +175,73 @@ def get_basic_rag_docs(prompt, src, doc_num):
     # doc = ' '.join(doc.split()[:200])
     return doc
 
+
+def select_diverse_examples(query, candidate_docs, doc_num=3):
+    if not candidate_docs:
+        return []
+    if len(candidate_docs) <= doc_num:
+        return candidate_docs
+
+    # Cluster similar candidates and choose one representative per cluster,
+    # favoring the document with highest query similarity inside each cluster.
+    texts = [query] + candidate_docs
+    embeddings = embedding_model.encode(texts, normalize_embeddings=True)
+    query_emb = embeddings[0]
+    doc_embs = embeddings[1:]
+
+    n_clusters = min(doc_num, len(candidate_docs))
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(doc_embs)
+
+    relevance_scores = np.dot(doc_embs, query_emb)
+    selected_indices = []
+    for cluster_id in range(n_clusters):
+        cluster_members = np.where(labels == cluster_id)[0]
+        best_idx = max(cluster_members, key=lambda i: relevance_scores[i])
+        selected_indices.append(int(best_idx))
+
+    selected_indices = sorted(selected_indices, key=lambda i: relevance_scores[i], reverse=True)
+    return [candidate_docs[i] for i in selected_indices[:doc_num]]
+
+
+def select_mmr_examples(query, candidate_docs, doc_num=3, mmr_lambda=0.7):
+    if not candidate_docs:
+        return []
+    if len(candidate_docs) <= doc_num:
+        return candidate_docs
+
+    # MMR: balance query relevance and novelty among already selected examples.
+    texts = [query] + candidate_docs
+    embeddings = embedding_model.encode(texts, normalize_embeddings=True)
+    query_emb = embeddings[0]
+    doc_embs = embeddings[1:]
+
+    relevance_scores = np.dot(doc_embs, query_emb)
+    selected = []
+    remaining = list(range(len(candidate_docs)))
+
+    while remaining and len(selected) < doc_num:
+        if not selected:
+            best_idx = max(remaining, key=lambda i: relevance_scores[i])
+            selected.append(best_idx)
+            remaining.remove(best_idx)
+            continue
+
+        selected_embs = doc_embs[selected]
+        best_idx = None
+        best_score = -1e9
+        for idx in remaining:
+            redundancy = float(np.max(np.dot(selected_embs, doc_embs[idx])))
+            score = (mmr_lambda * relevance_scores[idx]) - ((1 - mmr_lambda) * redundancy)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+
+    return [candidate_docs[i] for i in selected]
+
 def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_ollama', model='ollama-small', max_apis=None):
     with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
         api_list = [json.loads(x)['api'] for x in f.readlines()]
@@ -211,6 +280,20 @@ def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_
         if ('basic_rag' in baseline or baseline == 'similarity') and 'bug_detect' not in iter:
             rag_source = 'basic_rag_all' if baseline == 'similarity' else baseline
             docs = get_basic_rag_docs(basic_task_prompt, rag_source, doc_num)
+            final_task_prompt = f'''{basic_task_prompt} Use the following documents (surronded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+            for i, d in enumerate(docs):
+                final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        elif baseline == 'diversity' and 'bug_detect' not in iter:
+            # Retrieve a wider candidate pool, cluster them, and select 3 representatives.
+            candidates = get_basic_rag_docs(basic_task_prompt, 'basic_rag_all', max(30, doc_num * 10))
+            docs = select_diverse_examples(basic_task_prompt, candidates, doc_num=3)
+            final_task_prompt = f'''{basic_task_prompt} Use the following documents (surronded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+            for i, d in enumerate(docs):
+                final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        elif baseline == 'hybrid' and 'bug_detect' not in iter:
+            # Hybrid retrieval: dense retrieval + MMR re-ranking for relevance/diversity trade-off.
+            candidates = get_basic_rag_docs(basic_task_prompt, 'basic_rag_all', max(30, doc_num * 10))
+            docs = select_mmr_examples(basic_task_prompt, candidates, doc_num=3, mmr_lambda=0.7)
             final_task_prompt = f'''{basic_task_prompt} Use the following documents (surronded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
             for i, d in enumerate(docs):
                 final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
@@ -297,6 +380,20 @@ def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='ollama-s
             final_task_prompt = f'''{basic_task_prompt} Use the following documents (surronded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
             for i, d in enumerate(docs):
                 final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        elif baseline in ('diversity') and 'bug_detect' not in iter:
+            # Retrieve a wider candidate pool, cluster them, and select 3 representatives.
+            candidates = get_basic_rag_docs(basic_task_prompt, 'basic_rag_all', max(30, doc_num * 10))
+            docs = select_diverse_examples(basic_task_prompt, candidates, doc_num=3)
+            final_task_prompt = f'''{basic_task_prompt} Use the following documents (surronded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+            for i, d in enumerate(docs):
+                final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        elif baseline == 'hybrid' and 'bug_detect' not in iter:
+            # Hybrid retrieval: dense retrieval + MMR re-ranking for relevance/diversity trade-off.
+            candidates = get_basic_rag_docs(basic_task_prompt, 'basic_rag_all', max(30, doc_num * 10))
+            docs = select_mmr_examples(basic_task_prompt, candidates, doc_num=3, mmr_lambda=0.7)
+            final_task_prompt = f'''{basic_task_prompt} Use the following documents (surronded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+            for i, d in enumerate(docs):
+                final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
         elif 'api_rag' in baseline:
             if 'apidoc' in baseline:
                 doc = load_api_doc(api, lib)
@@ -374,6 +471,8 @@ if __name__=="__main__":
         'basic_rag_issues',
         'basic_rag_repos',
         'similarity',
+        'diversity',
+        'hybrid',
         'zero_shot',
         'api_rag_all',
         'api_rag_apidoc',
