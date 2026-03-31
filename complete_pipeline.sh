@@ -18,14 +18,18 @@ MODEL_ARG="${3:-}"
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export OLLAMA_TIMEOUT="${OLLAMA_TIMEOUT:-300}"
-export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434/v1}"
+export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://10.5.30.32:11434}"
+
+if [[ "$OLLAMA_BASE_URL" != */v1 ]]; then
+  export OLLAMA_BASE_URL="$OLLAMA_BASE_URL/v1"
+fi
 
 if [ -n "$MODEL_ARG" ]; then
   export OLLAMA_MODEL="$MODEL_ARG"
 elif [ -n "${MODEL_NAME:-}" ]; then
   export OLLAMA_MODEL="$MODEL_NAME"
 else
-  export OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5-coder:7b-instruct}"
+  export OLLAMA_MODEL="${OLLAMA_MODEL:-gpt-oss:20b}"
 fi
 
 export OLLAMA_AUTO_PULL="${OLLAMA_AUTO_PULL:-true}"
@@ -54,24 +58,44 @@ METHODS=(
   api_rag_repos
 )
 
-mkdir -p "log/$ITER"
+require_dir_exists() {
+  local dir="$1"
+  if [ ! -d "$dir" ]; then
+    echo "ERROR: Required directory does not exist: $dir"
+    echo "Create it before running this script."
+    exit 1
+  fi
+}
+
+require_dir_exists "log"
+require_dir_exists "log/$ITER"
 LOG_FILE="log/$ITER/full_alllibs_allapis.log"
 
 ensure_ollama_ready() {
   local base_url
   local server_url
+  local is_local
 
   base_url="$OLLAMA_BASE_URL"
   server_url="${base_url%/v1}"
-
-  if ! command -v ollama >/dev/null 2>&1; then
-    echo "ERROR: ollama command not found in PATH." | tee -a "$LOG_FILE"
-    exit 1
+  is_local=0
+  if [ "$server_url" = "http://localhost:11434" ] || [ "$server_url" = "http://127.0.0.1:11434" ]; then
+    is_local=1
   fi
 
   if curl -fsS "$server_url/api/tags" >/dev/null 2>&1; then
     echo "Ollama server already running at $server_url" | tee -a "$LOG_FILE"
   else
+    if [ "$is_local" -ne 1 ]; then
+      echo "ERROR: Remote Ollama server not reachable at $server_url" | tee -a "$LOG_FILE"
+      exit 1
+    fi
+
+    if ! command -v ollama >/dev/null 2>&1; then
+      echo "ERROR: ollama command not found in PATH." | tee -a "$LOG_FILE"
+      exit 1
+    fi
+
     echo "Ollama server not reachable. Starting ollama serve..." | tee -a "$LOG_FILE"
     nohup ollama serve > "log/$ITER/ollama_serve.log" 2>&1 &
 
@@ -92,15 +116,29 @@ ensure_ollama_ready() {
     echo "Ollama server started at $server_url" | tee -a "$LOG_FILE"
   fi
 
-  if ollama list | awk '{print $1}' | grep -Fx "$OLLAMA_MODEL" >/dev/null 2>&1; then
-    echo "Ollama model available: $OLLAMA_MODEL" | tee -a "$LOG_FILE"
-  else
-    if [ "$OLLAMA_AUTO_PULL" = "true" ]; then
-      echo "Model $OLLAMA_MODEL not found locally. Pulling..." | tee -a "$LOG_FILE"
-      ollama pull "$OLLAMA_MODEL" 2>&1 | tee -a "$LOG_FILE"
-    else
-      echo "ERROR: Model $OLLAMA_MODEL not found and OLLAMA_AUTO_PULL=false" | tee -a "$LOG_FILE"
+  if [ "$is_local" -eq 1 ]; then
+    if ! command -v ollama >/dev/null 2>&1; then
+      echo "ERROR: ollama command not found in PATH." | tee -a "$LOG_FILE"
       exit 1
+    fi
+
+    if ollama list | awk '{print $1}' | grep -Fx "$OLLAMA_MODEL" >/dev/null 2>&1; then
+      echo "Ollama model available: $OLLAMA_MODEL" | tee -a "$LOG_FILE"
+    else
+      if [ "$OLLAMA_AUTO_PULL" = "true" ]; then
+        echo "Model $OLLAMA_MODEL not found locally. Pulling..." | tee -a "$LOG_FILE"
+        ollama pull "$OLLAMA_MODEL" 2>&1 | tee -a "$LOG_FILE"
+      else
+        echo "ERROR: Model $OLLAMA_MODEL not found and OLLAMA_AUTO_PULL=false" | tee -a "$LOG_FILE"
+        exit 1
+      fi
+    fi
+  else
+    if curl -fsS "$server_url/api/tags" | grep -F "\"name\":\"$OLLAMA_MODEL\"" >/dev/null 2>&1; then
+      echo "Remote model available: $OLLAMA_MODEL" | tee -a "$LOG_FILE"
+    else
+      echo "WARN: Could not confirm model $OLLAMA_MODEL from $server_url/api/tags" | tee -a "$LOG_FILE"
+      echo "Proceeding anyway; generation will fail later if the model is unavailable." | tee -a "$LOG_FILE"
     fi
   fi
 }

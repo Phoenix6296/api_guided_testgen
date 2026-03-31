@@ -16,6 +16,14 @@ ROOT_PATH=os.getenv('PRJ_ROOT_DIR') or os.getcwd()
 YOUR_ID=os.getenv('YOUR_ID')
 
 
+def require_dir_exists(path):
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f'Required directory does not exist: {path}. '
+            'Create it before running this script.'
+        )
+
+
 def get_source_root(lib):
     if lib == 'torch':
         return os.path.dirname(torch.__file__)
@@ -34,7 +42,7 @@ def get_coverage_json(lib, baseline, iter):
     src = get_source_root(lib)
     path = f'{ROOT_PATH}/out/{iter}/exec/{baseline}/{lib}/'
     w_path = f'{ROOT_PATH}/out/{iter}/coverage/'
-    os.makedirs(w_path, exist_ok=True)
+    require_dir_exists(w_path)
     if not src:
         print(f'Unknown library for coverage source: {lib}')
         return

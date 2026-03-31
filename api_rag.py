@@ -22,8 +22,17 @@ import tensorflow as tf
 tf.get_logger().setLevel('ERROR')  # for tf2.x
 tf.autograph.set_verbosity(0)
 
-OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434/v1')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen2.5-coder:7b-instruct')
+def normalize_ollama_base_url(raw_url: str) -> str:
+    url = (raw_url or '').rstrip('/')
+    if not url:
+        url = 'http://10.5.30.32:11434'
+    if not url.endswith('/v1'):
+        url = f'{url}/v1'
+    return url
+
+
+OLLAMA_BASE_URL = normalize_ollama_base_url(os.getenv('OLLAMA_BASE_URL', 'http://10.5.30.32:11434'))
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'gpt-oss:20b')
 OLLAMA_TIMEOUT = float(os.getenv('OLLAMA_TIMEOUT', '120'))
 
 ollama_client = OpenAI(
@@ -31,6 +40,14 @@ ollama_client = OpenAI(
     api_key=os.getenv('OLLAMA_API_KEY', 'ollama')
 )
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+def require_dir_exists(path):
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f'Required directory does not exist: {path}. '
+            'Create it before running this script.'
+        )
 
 def get_covered(class_paths, cov_infos, api):
     # get search string depending on the case
@@ -334,7 +351,7 @@ def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_
         if baseline == 'zero_shot':
             continue
             
-        os.makedirs(f'out/{iter}/prompt/{baseline}/{lib}/', exist_ok=True)
+        require_dir_exists(f'out/{iter}/prompt/{baseline}/{lib}/')
         with open(prompt_file_path, 'w') as f:
             f.write(final_task_prompt)
         
@@ -440,12 +457,12 @@ def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='ollama-s
         ]
         res = get_completion_ollama(prompt, model_name=model_name)
         
-        os.makedirs(f'out/{iter}/generated/{baseline}/{lib}/', exist_ok=True)
+        require_dir_exists(f'out/{iter}/generated/{baseline}/{lib}/')
         with open(f'out/{iter}/generated/{baseline}/{lib}/{api}', 'w') as f:
             f.write(res)
         if baseline == 'zero_shot':
             continue
-        os.makedirs(f'out/{iter}/prompt/{baseline}/{lib}/', exist_ok=True)
+        require_dir_exists(f'out/{iter}/prompt/{baseline}/{lib}/')
         with open(f'out/{iter}/prompt/{baseline}/{lib}/{api}', 'w') as f:
             f.write(final_task_prompt)
         
@@ -460,7 +477,7 @@ if __name__=="__main__":
     if len(sys.argv) >= 6:
         max_apis = int(sys.argv[5])
     
-    os.makedirs(f'log/{iter}', exist_ok=True)
+    require_dir_exists(f'log/{iter}')
 
     # generate_prompt(baseline=baseline, lib=lib, doc_num=3, iter=iter, model=fm)
     
