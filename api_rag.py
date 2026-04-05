@@ -352,8 +352,8 @@ def select_mmr_examples(query, candidate_docs, doc_num=3, mmr_lambda=0.7):
 
 def get_hybrid_docs(prompt, api, lib, doc_num):
     # MMR-based hybrid retrieval over basic_rag_all candidates.
-    candidates = get_basic_rag_docs(prompt, 'basic_rag_all', max(30, FIXED_RAG_EXAMPLES * 10))
-    return select_mmr_examples(prompt, candidates, doc_num=FIXED_RAG_EXAMPLES, mmr_lambda=0.7)
+    candidates = get_basic_rag_docs(prompt, 'basic_rag_all', max(30, doc_num * 10))
+    return select_mmr_examples(prompt, candidates, doc_num=doc_num, mmr_lambda=0.7)
 
 def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_ollama', model='ollama-small', max_apis=None):
     with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
@@ -498,7 +498,7 @@ def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='ollama-s
             final_task_prompt = f'''{basic_task_prompt} Use the following documents (surronded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
             for i, d in enumerate(docs):
                 final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-        elif baseline in ('diversity') and 'bug_detect' not in iter:
+        elif baseline == 'diversity' and 'bug_detect' not in iter:
             # Retrieve a wider candidate pool, cluster them, and select 3 representatives.
             candidates = get_basic_rag_docs(basic_task_prompt, 'basic_rag_all', max(30, FIXED_RAG_EXAMPLES * 10))
             docs = select_diverse_examples(basic_task_prompt, candidates, doc_num=FIXED_RAG_EXAMPLES)

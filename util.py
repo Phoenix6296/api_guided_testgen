@@ -3,9 +3,11 @@ import sys
 import json
 import ast
 import inspect
+import numpy as np
 from tqdm import tqdm 
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans
 import chromadb
 import torch
 import tensorflow as tf
@@ -48,6 +50,86 @@ def get_basic_rag_docs(prompt, src, doc_num):
         n_results=doc_num,
     )
     return retriever_results["documents"][0]
+
+
+def _prepare_candidates(candidate_docs):
+    cleaned = []
+    seen = set()
+    for doc in candidate_docs:
+        if not doc:
+            continue
+        text = doc.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    return cleaned
+
+
+def select_diverse_examples(query, candidate_docs, doc_num=3):
+    candidate_docs = _prepare_candidates(candidate_docs)
+    if not candidate_docs:
+        return []
+    if len(candidate_docs) <= doc_num:
+        return candidate_docs
+
+    texts = [query] + candidate_docs
+    embeddings = embedding_model.encode(texts, normalize_embeddings=True)
+    query_emb = embeddings[0]
+    doc_embs = np.array(embeddings[1:])
+
+    n_clusters = min(doc_num, len(candidate_docs))
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(doc_embs)
+
+    relevance_scores = np.dot(doc_embs, query_emb)
+    selected_indices = []
+    for cluster_id in range(n_clusters):
+        cluster_members = np.where(labels == cluster_id)[0]
+        best_idx = max(cluster_members, key=lambda i: relevance_scores[i])
+        selected_indices.append(int(best_idx))
+
+    selected_indices = sorted(selected_indices, key=lambda i: relevance_scores[i], reverse=True)
+    return [candidate_docs[i] for i in selected_indices[:doc_num]]
+
+
+def select_mmr_examples(query, candidate_docs, doc_num=3, mmr_lambda=0.7):
+    candidate_docs = _prepare_candidates(candidate_docs)
+    if not candidate_docs:
+        return []
+    if len(candidate_docs) <= doc_num:
+        return candidate_docs
+
+    texts = [query] + candidate_docs
+    embeddings = embedding_model.encode(texts, normalize_embeddings=True)
+    query_emb = embeddings[0]
+    doc_embs = np.array(embeddings[1:])
+
+    relevance_scores = np.dot(doc_embs, query_emb)
+    selected = []
+    remaining = list(range(len(candidate_docs)))
+
+    while remaining and len(selected) < doc_num:
+        if not selected:
+            best_idx = max(remaining, key=lambda i: relevance_scores[i])
+            selected.append(best_idx)
+            remaining.remove(best_idx)
+            continue
+
+        selected_embs = doc_embs[selected]
+        best_idx = None
+        best_score = float("-inf")
+        for idx in remaining:
+            redundancy = float(np.max(np.dot(selected_embs, doc_embs[idx])))
+            score = (mmr_lambda * relevance_scores[idx]) - ((1 - mmr_lambda) * redundancy)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+
+    return [candidate_docs[i] for i in selected]
 
 def get_api_list(lib='tf'):
     try:
@@ -310,9 +392,26 @@ def calculate_cost(lib, baseline, iter):
     for api in api_list:
         doc_prompt = f'Generate a python unit test case to test the functionality of {api} API in {library.get(lib)} library with maximum coverage.'
         basic_prompt = 'Only create new tests if they cover new lines of code. Generate test suite using unittest library so it can be directly runnable (with the necessary imports and a main function).'
+        gpt_prompt = f'{doc_prompt} {basic_prompt}'
         if 'basic_rag' in baseline_dir:
             docs = get_basic_rag_docs(doc_prompt, baseline_dir, 3)
-            # return
+            gpt_prompt = f'''{doc_prompt} Use the following documents (surronded by @@@) to make the test case more compilable and passable. {basic_prompt}'''
+            for i, d in enumerate(docs):
+                gpt_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        elif baseline_dir == 'similarity':
+            docs = get_basic_rag_docs(doc_prompt, 'basic_rag_all', 3)
+            gpt_prompt = f'''{doc_prompt} Use the following documents (surronded by @@@) to make the test case more compilable and passable. {basic_prompt}'''
+            for i, d in enumerate(docs):
+                gpt_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        elif baseline_dir == 'diversity':
+            candidates = get_basic_rag_docs(doc_prompt, 'basic_rag_all', 30)
+            docs = select_diverse_examples(doc_prompt, candidates, doc_num=3)
+            gpt_prompt = f'''{doc_prompt} Use the following documents (surronded by @@@) to make the test case more compilable and passable. {basic_prompt}'''
+            for i, d in enumerate(docs):
+                gpt_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        elif baseline_dir == 'hybrid':
+            candidates = get_basic_rag_docs(doc_prompt, 'basic_rag_all', 30)
+            docs = select_mmr_examples(doc_prompt, candidates, doc_num=3, mmr_lambda=0.7)
             gpt_prompt = f'''{doc_prompt} Use the following documents (surronded by @@@) to make the test case more compilable and passable. {basic_prompt}'''
             for i, d in enumerate(docs):
                 gpt_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
