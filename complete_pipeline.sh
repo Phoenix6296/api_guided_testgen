@@ -13,7 +13,7 @@ fi
 
 PY="/Users/krishna/Documents/api_guided_testgen/.demo/bin/python"
 ITER_SUFFIX="${1:-}"
-MAX_APIS="${2:-}"
+MAX_APIS="${2:-3}"
 MODEL_ARG="${3:-}"
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -46,6 +46,8 @@ METHODS=(
   basic_rag_issues
   basic_rag_repos
   similarity
+  diversity
+  hybrid
   zero_shot
   api_rag_all
   api_rag_apidoc
