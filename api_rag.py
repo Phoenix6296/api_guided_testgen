@@ -6,8 +6,8 @@ import numpy as np
 import json
 import os
 import sys
-from huggingface_hub import InferenceClient
-from huggingface_hub.errors import InferenceTimeoutError, HfHubHTTPError
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
@@ -25,11 +25,10 @@ HF_MAX_NEW_TOKENS = int(os.getenv('HF_MAX_NEW_TOKENS', '768'))
 HF_DO_SAMPLE = os.getenv('HF_DO_SAMPLE', 'false').lower() == 'true'
 HF_TEMPERATURE = float(os.getenv('HF_TEMPERATURE', '0.0'))
 HF_TOP_P = float(os.getenv('HF_TOP_P', '0.95'))
-HF_TIMEOUT = float(os.getenv('HF_TIMEOUT', '120'))
-HF_API_TOKEN = os.getenv('HF_API_TOKEN') or os.getenv('HUGGINGFACEHUB_API_TOKEN') or os.getenv('HF_TOKEN')
 FIXED_RAG_EXAMPLES = 3
 
-_hf_client = None
+_hf_generators = {}
+_hf_tokenizers = {}
 
 
 def normalize_hf_model_id(model_name):
@@ -44,11 +43,21 @@ def normalize_hf_model_id(model_name):
     return aliases.get(model_name, model_name)
 
 
-def get_hf_client():
-    global _hf_client
-    if _hf_client is None:
-        _hf_client = InferenceClient(api_key=HF_API_TOKEN, timeout=HF_TIMEOUT)
-    return _hf_client
+def get_transformers_generator(model_name=None):
+    target_model = normalize_hf_model_id(model_name or HF_MODEL_ID)
+    if target_model in _hf_generators:
+        return _hf_generators[target_model], _hf_tokenizers[target_model]
+
+    tokenizer = AutoTokenizer.from_pretrained(target_model)
+    model = AutoModelForCausalLM.from_pretrained(
+        target_model,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map='auto' if torch.cuda.is_available() else None,
+    )
+    generator = pipeline('text-generation', model=model, tokenizer=tokenizer)
+    _hf_generators[target_model] = generator
+    _hf_tokenizers[target_model] = tokenizer
+    return generator, tokenizer
 
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -118,29 +127,31 @@ def load_doc(lib='tf', src='issues'):
 
 @backoff.on_exception(
     backoff.expo,
-    (InferenceTimeoutError, HfHubHTTPError, TimeoutError, RuntimeError, OSError, ValueError),
+    (RuntimeError, OSError, ValueError),
     max_tries=4,
 )
 def get_completion_hf(messages, model_name=None):
-    client = get_hf_client()
-    target_model = normalize_hf_model_id(model_name or HF_MODEL_ID)
+    generator, tokenizer = get_transformers_generator(model_name=model_name)
+
+    # Use the model chat template, then generate only the assistant continuation.
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     request_kwargs = {
-        'model': target_model,
-        'messages': messages,
-        'max_tokens': HF_MAX_NEW_TOKENS,
+        'max_new_tokens': HF_MAX_NEW_TOKENS,
+        'return_full_text': False,
     }
     if HF_DO_SAMPLE:
         request_kwargs['temperature'] = HF_TEMPERATURE
         request_kwargs['top_p'] = HF_TOP_P
+        request_kwargs['do_sample'] = True
     else:
-        request_kwargs['temperature'] = 0.0
+        request_kwargs['do_sample'] = False
 
-    response = client.chat.completions.create(**request_kwargs)
-    content = response.choices[0].message.content
-    if isinstance(content, list):
-        text_blocks = [c.text for c in content if getattr(c, 'type', None) == 'text' and getattr(c, 'text', None)]
-        return '\n'.join(text_blocks).strip()
-    return (content or '').strip()
+    response = generator(prompt, **request_kwargs)
+    return response[0]['generated_text'].strip()
 
 
 REFUSAL_MARKERS = [
@@ -619,12 +630,10 @@ if __name__=="__main__":
         print('incorrect baseline!')
     else:
         print('Generating TCs for', lib, 'library using', baseline, 'iter', iter, 'model', fm)
-        if not HF_API_TOKEN:
-            print('WARNING: HF_API_TOKEN/HUGGINGFACEHUB_API_TOKEN not set; hosted inference may fail or be rate-limited.')
         if fm.startswith('hf:'):
             print('Using Hugging Face model override:', fm.split(':', 1)[1])
         elif fm and fm != 'hf-local':
             print('Using Hugging Face model override:', fm)
-        print('Using hosted Hugging Face model:', normalize_hf_model_id(HF_MODEL_ID))
+        print('Using local Transformers model:', normalize_hf_model_id(HF_MODEL_ID))
         run_exp(baseline=baseline, lib=lib, doc_num=3, iter=iter, model=fm, max_apis=max_apis)
 

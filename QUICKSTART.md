@@ -1,6 +1,6 @@
-# Quick Start: Hosted Hugging Face End-to-End
+# Quick Start: Local Transformers End-to-End
 
-This guide runs the project with hosted Hugging Face inference (no local model download), including:
+This guide runs the project with local Transformers inference, including:
 
 1. Creating required `.jsonl` files
 2. Generating tests
@@ -20,19 +20,18 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## 2) Set model and token in .env
+## 2) Set model in .env
 
 The full pipeline script reads `.env` automatically and uses `MODEL_NAME`.
 Current default in this repo:
 
 ```dotenv
 MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
-HF_API_TOKEN=your_huggingface_token
 ```
 
 You can change this value any time before starting a run.
 
-## 3) Set environment variables for hosted generation
+## 3) Set environment variables for local generation
 
 ```bash
 source .demo/bin/activate
@@ -42,15 +41,13 @@ export HF_MAX_NEW_TOKENS="768"
 export HF_DO_SAMPLE="false"
 export HF_TEMPERATURE="0.0"
 export HF_TOP_P="0.95"
-export HF_TIMEOUT="120"
 export TOKENIZERS_PARALLELISM="false"
 export PYTHONUNBUFFERED=1
 ```
 
 Note: `complete_pipeline.sh` sets `HF_MODEL_ID` from
 `MODEL_NAME` in `.env` (or from CLI arg 3 if provided), so you usually do not
-need to export `HF_MODEL_ID` manually. It also requires `HF_API_TOKEN`
-(or `HUGGINGFACEHUB_API_TOKEN`) to call hosted inference.
+need to export `HF_MODEL_ID` manually.
 
 ## 4) Run full pipeline (generation + evaluation + coverage + util)
 
