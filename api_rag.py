@@ -1,6 +1,4 @@
 import backoff
-from openai import OpenAI
-import openai
 import chromadb
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
@@ -8,6 +6,8 @@ import numpy as np
 import json
 import os
 import sys
+from huggingface_hub import InferenceClient
+from huggingface_hub.errors import InferenceTimeoutError, HfHubHTTPError
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
@@ -20,15 +20,36 @@ import tensorflow as tf
 tf.get_logger().setLevel('ERROR')  # for tf2.x
 tf.autograph.set_verbosity(0)
 
-OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434/v1')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen2.5-coder:7b-instruct')
-OLLAMA_TIMEOUT = float(os.getenv('OLLAMA_TIMEOUT', '120'))
+HF_MODEL_ID = os.getenv('HF_MODEL_ID', 'Qwen/Qwen2.5-7B-Instruct')
+HF_MAX_NEW_TOKENS = int(os.getenv('HF_MAX_NEW_TOKENS', '768'))
+HF_DO_SAMPLE = os.getenv('HF_DO_SAMPLE', 'false').lower() == 'true'
+HF_TEMPERATURE = float(os.getenv('HF_TEMPERATURE', '0.0'))
+HF_TOP_P = float(os.getenv('HF_TOP_P', '0.95'))
+HF_TIMEOUT = float(os.getenv('HF_TIMEOUT', '120'))
+HF_API_TOKEN = os.getenv('HF_API_TOKEN') or os.getenv('HUGGINGFACEHUB_API_TOKEN') or os.getenv('HF_TOKEN')
 FIXED_RAG_EXAMPLES = 3
 
-ollama_client = OpenAI(
-    base_url=OLLAMA_BASE_URL,
-    api_key=os.getenv('OLLAMA_API_KEY', 'ollama')
-)
+_hf_client = None
+
+
+def normalize_hf_model_id(model_name):
+    if not model_name:
+        return 'Qwen/Qwen2.5-7B-Instruct'
+
+    aliases = {
+        'qwen2.5-coder:7b-instruct': 'Qwen/Qwen2.5-7B-Instruct',
+        'qwen2.5:7b-instruct': 'Qwen/Qwen2.5-7B-Instruct',
+        'qwen2.5-7b': 'Qwen/Qwen2.5-7B-Instruct',
+    }
+    return aliases.get(model_name, model_name)
+
+
+def get_hf_client():
+    global _hf_client
+    if _hf_client is None:
+        _hf_client = InferenceClient(api_key=HF_API_TOKEN, timeout=HF_TIMEOUT)
+    return _hf_client
+
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def get_covered(class_paths, cov_infos, api):
@@ -97,23 +118,29 @@ def load_doc(lib='tf', src='issues'):
 
 @backoff.on_exception(
     backoff.expo,
-    (
-        openai.APIConnectionError,
-        openai.APITimeoutError,
-        openai.RateLimitError,
-        openai.APIError,
-    ),
+    (InferenceTimeoutError, HfHubHTTPError, TimeoutError, RuntimeError, OSError, ValueError),
     max_tries=4,
 )
-def get_completion_ollama(messages, model_name=None):
-    target_model = model_name or OLLAMA_MODEL
-    response = ollama_client.chat.completions.create(
-        model=target_model,
-        messages=messages,
-        temperature=0,
-        timeout=OLLAMA_TIMEOUT,
-    )
-    return response.choices[0].message.content.strip()
+def get_completion_hf(messages, model_name=None):
+    client = get_hf_client()
+    target_model = normalize_hf_model_id(model_name or HF_MODEL_ID)
+    request_kwargs = {
+        'model': target_model,
+        'messages': messages,
+        'max_tokens': HF_MAX_NEW_TOKENS,
+    }
+    if HF_DO_SAMPLE:
+        request_kwargs['temperature'] = HF_TEMPERATURE
+        request_kwargs['top_p'] = HF_TOP_P
+    else:
+        request_kwargs['temperature'] = 0.0
+
+    response = client.chat.completions.create(**request_kwargs)
+    content = response.choices[0].message.content
+    if isinstance(content, list):
+        text_blocks = [c.text for c in content if getattr(c, 'type', None) == 'text' and getattr(c, 'text', None)]
+        return '\n'.join(text_blocks).strip()
+    return (content or '').strip()
 
 
 REFUSAL_MARKERS = [
@@ -189,7 +216,7 @@ def generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib
         {"role": "system", "content": strict_sys_prompt},
         {"role": "user", "content": final_task_prompt}
     ]
-    res = get_completion_ollama(prompt, model_name=model_name)
+    res = get_completion_hf(prompt, model_name=model_name)
 
     if is_refusal_response(res):
         retry_prompt = (
@@ -201,7 +228,7 @@ def generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib
             {"role": "system", "content": strict_sys_prompt},
             {"role": "user", "content": retry_prompt},
         ]
-        res = get_completion_ollama(retry_messages, model_name=model_name)
+        res = get_completion_hf(retry_messages, model_name=model_name)
 
     if is_refusal_response(res):
         return build_fallback_test(api, lib)
@@ -355,7 +382,7 @@ def get_hybrid_docs(prompt, api, lib, doc_num):
     candidates = get_basic_rag_docs(prompt, 'basic_rag_all', max(30, doc_num * 10))
     return select_mmr_examples(prompt, candidates, doc_num=doc_num, mmr_lambda=0.7)
 
-def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_ollama', model='ollama-small', max_apis=None):
+def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='hosted_hf', model='hf-local', max_apis=None):
     with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
         api_list = [json.loads(x)['api'] for x in f.readlines()]
     if max_apis is not None:
@@ -451,7 +478,7 @@ def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_
             f.write(final_task_prompt)
         
 
-def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='ollama-small', max_apis=None):
+def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='hf-local', max_apis=None):
     if baseline == 'iterative':
         with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
             classes = [x for x in f.readlines()]
@@ -540,10 +567,12 @@ def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='ollama-s
             final_task_prompt = f'{basic_task_prompt} {post_prompt}'
         
         sys_prompt = f"You are a unit test suite generator for {library} library."
-        if model.startswith('ollama:'):
+        if model.startswith('hf:'):
             model_name = model.split(':', 1)[1]
+        elif model and model != 'hf-local':
+            model_name = model
         else:
-            model_name = OLLAMA_MODEL
+            model_name = HF_MODEL_ID
 
         res = generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib)
         
@@ -590,8 +619,12 @@ if __name__=="__main__":
         print('incorrect baseline!')
     else:
         print('Generating TCs for', lib, 'library using', baseline, 'iter', iter, 'model', fm)
-        if not fm.startswith('ollama'):
-            print('Ignoring non-local model selector:', fm, '-> using local Ollama model:', OLLAMA_MODEL)
-        print('Using local Ollama endpoint:', OLLAMA_BASE_URL, 'model:', OLLAMA_MODEL)
+        if not HF_API_TOKEN:
+            print('WARNING: HF_API_TOKEN/HUGGINGFACEHUB_API_TOKEN not set; hosted inference may fail or be rate-limited.')
+        if fm.startswith('hf:'):
+            print('Using Hugging Face model override:', fm.split(':', 1)[1])
+        elif fm and fm != 'hf-local':
+            print('Using Hugging Face model override:', fm)
+        print('Using hosted Hugging Face model:', normalize_hf_model_id(HF_MODEL_ID))
         run_exp(baseline=baseline, lib=lib, doc_num=3, iter=iter, model=fm, max_apis=max_apis)
 

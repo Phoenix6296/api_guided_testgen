@@ -13,25 +13,35 @@ fi
 
 PY="/Users/krishna/Documents/api_guided_testgen/.demo/bin/python"
 ITER_SUFFIX="${1:-}"
-MAX_APIS="${2:-3}"
+MAX_APIS="${2:-20}"
 MODEL_ARG="${3:-}"
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-export OLLAMA_TIMEOUT="${OLLAMA_TIMEOUT:-300}"
-export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434/v1}"
+export HF_MAX_NEW_TOKENS="${HF_MAX_NEW_TOKENS:-768}"
+export HF_DO_SAMPLE="${HF_DO_SAMPLE:-false}"
+export HF_TEMPERATURE="${HF_TEMPERATURE:-0.0}"
+export HF_TOP_P="${HF_TOP_P:-0.95}"
+export HF_TIMEOUT="${HF_TIMEOUT:-120}"
 
 if [ -n "$MODEL_ARG" ]; then
-  export OLLAMA_MODEL="$MODEL_ARG"
+  export HF_MODEL_ID="$MODEL_ARG"
 elif [ -n "${MODEL_NAME:-}" ]; then
-  export OLLAMA_MODEL="$MODEL_NAME"
+  export HF_MODEL_ID="$MODEL_NAME"
 else
-  export OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5-coder:7b-instruct}"
+  export HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen2.5-7B-Instruct}"
 fi
 
-export OLLAMA_AUTO_PULL="${OLLAMA_AUTO_PULL:-true}"
+if [ "$HF_MODEL_ID" = "qwen2.5-coder:7b-instruct" ] || [ "$HF_MODEL_ID" = "qwen2.5:7b-instruct" ] || [ "$HF_MODEL_ID" = "qwen2.5-7b" ]; then
+  export HF_MODEL_ID="Qwen/Qwen2.5-7B-Instruct"
+fi
+
+if [ -z "${HF_API_TOKEN:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
+  export HF_API_TOKEN="$HF_TOKEN"
+fi
+
 export PATH="/Users/krishna/Documents/api_guided_testgen/.demo/bin:$PATH"
 
-LLM_NAME="$(printf '%s' "$OLLAMA_MODEL" | sed 's/[^A-Za-z0-9._-]/_/g')"
+LLM_NAME="$(printf '%s' "$HF_MODEL_ID" | sed 's/[^A-Za-z0-9._-]/_/g')"
 if [ -n "$ITER_SUFFIX" ]; then
   ITER="$LLM_NAME/$ITER_SUFFIX"
 else
@@ -59,65 +69,20 @@ METHODS=(
 mkdir -p "log/$ITER"
 LOG_FILE="log/$ITER/full_alllibs_allapis.log"
 
-ensure_ollama_ready() {
-  local base_url
-  local server_url
-
-  base_url="$OLLAMA_BASE_URL"
-  server_url="${base_url%/v1}"
-
-  if ! command -v ollama >/dev/null 2>&1; then
-    echo "ERROR: ollama command not found in PATH." | tee -a "$LOG_FILE"
-    exit 1
-  fi
-
-  if curl -fsS "$server_url/api/tags" >/dev/null 2>&1; then
-    echo "Ollama server already running at $server_url" | tee -a "$LOG_FILE"
-  else
-    echo "Ollama server not reachable. Starting ollama serve..." | tee -a "$LOG_FILE"
-    nohup ollama serve > "log/$ITER/ollama_serve.log" 2>&1 &
-
-    local ok=0
-    for _ in $(seq 1 30); do
-      sleep 1
-      if curl -fsS "$server_url/api/tags" >/dev/null 2>&1; then
-        ok=1
-        break
-      fi
-    done
-
-    if [ "$ok" -ne 1 ]; then
-      echo "ERROR: Could not start/connect to Ollama at $server_url" | tee -a "$LOG_FILE"
-      exit 1
-    fi
-
-    echo "Ollama server started at $server_url" | tee -a "$LOG_FILE"
-  fi
-
-  if ollama list | awk '{print $1}' | grep -Fx "$OLLAMA_MODEL" >/dev/null 2>&1; then
-    echo "Ollama model available: $OLLAMA_MODEL" | tee -a "$LOG_FILE"
-  else
-    if [ "$OLLAMA_AUTO_PULL" = "true" ]; then
-      echo "Model $OLLAMA_MODEL not found locally. Pulling..." | tee -a "$LOG_FILE"
-      ollama pull "$OLLAMA_MODEL" 2>&1 | tee -a "$LOG_FILE"
-    else
-      echo "ERROR: Model $OLLAMA_MODEL not found and OLLAMA_AUTO_PULL=false" | tee -a "$LOG_FILE"
-      exit 1
-    fi
-  fi
-}
-
 echo "ITER=$ITER" | tee -a "$LOG_FILE"
 echo "LLM_NAME=$LLM_NAME" | tee -a "$LOG_FILE"
-echo "OLLAMA_MODEL=$OLLAMA_MODEL" | tee -a "$LOG_FILE"
+echo "HF_MODEL_ID=$HF_MODEL_ID" | tee -a "$LOG_FILE"
+if [ -n "${HF_API_TOKEN:-}" ] || [ -n "${HUGGINGFACEHUB_API_TOKEN:-}" ] || [ -n "${HF_TOKEN:-}" ]; then
+  echo "HF_API_TOKEN=SET" | tee -a "$LOG_FILE"
+else
+  echo "ERROR: Set HF_API_TOKEN (or HUGGINGFACEHUB_API_TOKEN) for hosted Hugging Face inference." | tee -a "$LOG_FILE"
+  exit 1
+fi
 if [ -n "$MAX_APIS" ]; then
   echo "MAX_APIS=$MAX_APIS (limited run)" | tee -a "$LOG_FILE"
 else
   echo "MAX_APIS=ALL (full run)" | tee -a "$LOG_FILE"
 fi
-
-echo "=== PRECHECK: OLLAMA ===" | tee -a "$LOG_FILE"
-ensure_ollama_ready
 
 echo "=== STEP 1: BUILD data/api_db + api_db ===" | tee -a "$LOG_FILE"
 "$PY" rebuild_api_db_from_lists.py 2>&1 | tee -a "$LOG_FILE"
@@ -128,9 +93,9 @@ run_pair() {
 
   echo "=== GENERATE $lib $method ===" | tee -a "$LOG_FILE"
   if [ -n "$MAX_APIS" ]; then
-    "$PY" api_rag.py "$lib" "$method" "$ITER" ollama-small "$MAX_APIS" 2>&1 | tee -a "$LOG_FILE"
+    "$PY" api_rag.py "$lib" "$method" "$ITER" "$HF_MODEL_ID" "$MAX_APIS" 2>&1 | tee -a "$LOG_FILE"
   else
-    "$PY" api_rag.py "$lib" "$method" "$ITER" ollama-small 2>&1 | tee -a "$LOG_FILE"
+    "$PY" api_rag.py "$lib" "$method" "$ITER" "$HF_MODEL_ID" 2>&1 | tee -a "$LOG_FILE"
   fi
 
   echo "=== EVALUATE $lib $method ===" | tee -a "$LOG_FILE"

@@ -1,6 +1,6 @@
-# Quick Start: Local Ollama End-to-End
+# Quick Start: Hosted Hugging Face End-to-End
 
-This guide runs the project fully local (Ollama only), including:
+This guide runs the project with hosted Hugging Face inference (no local model download), including:
 
 1. Creating required `.jsonl` files
 2. Generating tests
@@ -20,46 +20,39 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## 2) Set model in .env
+## 2) Set model and token in .env
 
 The full pipeline script reads `.env` automatically and uses `MODEL_NAME`.
 Current default in this repo:
 
 ```dotenv
-MODEL_NAME=qwen2.5-coder:7b-instruct
+MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+HF_API_TOKEN=your_huggingface_token
 ```
 
 You can change this value any time before starting a run.
 
-## 3) Ensure Ollama is running and model is available
-
-```bash
-ollama serve
-```
-
-In another terminal (optional pre-pull):
-
-```bash
-ollama pull qwen2.5-coder:7b-instruct
-ollama list
-```
-
-## 4) Set environment variables for local generation
+## 3) Set environment variables for hosted generation
 
 ```bash
 source .demo/bin/activate
 
-export OLLAMA_BASE_URL="http://localhost:11434/v1"
-export OLLAMA_TIMEOUT="300"
+export HF_MODEL_ID="Qwen/Qwen2.5-7B-Instruct"
+export HF_MAX_NEW_TOKENS="768"
+export HF_DO_SAMPLE="false"
+export HF_TEMPERATURE="0.0"
+export HF_TOP_P="0.95"
+export HF_TIMEOUT="120"
 export TOKENIZERS_PARALLELISM="false"
 export PYTHONUNBUFFERED=1
 ```
 
-Note: `complete_pipeline.sh` sets `OLLAMA_MODEL` from
+Note: `complete_pipeline.sh` sets `HF_MODEL_ID` from
 `MODEL_NAME` in `.env` (or from CLI arg 3 if provided), so you usually do not
-need to export `OLLAMA_MODEL` manually.
+need to export `HF_MODEL_ID` manually. It also requires `HF_API_TOKEN`
+(or `HUGGINGFACEHUB_API_TOKEN`) to call hosted inference.
 
-## 5) Run full pipeline (generation + evaluation + coverage + util)
+## 4) Run full pipeline (generation + evaluation + coverage + util)
 
 ### Recommended: one-command pipeline via complete_pipeline.sh
 
