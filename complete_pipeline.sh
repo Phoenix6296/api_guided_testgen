@@ -13,7 +13,7 @@ fi
 
 PY="/Users/krishna/Documents/api_guided_testgen/.demo/bin/python"
 ITER_SUFFIX="${1:-}"
-MAX_APIS="${2:-20}"
+MAX_APIS="${2:-100}"
 MODEL_ARG="${3:-}"
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"

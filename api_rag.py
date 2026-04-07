@@ -29,6 +29,8 @@ FIXED_RAG_EXAMPLES = 3
 
 _hf_generators = {}
 _hf_tokenizers = {}
+_api_rag_client = None
+_api_rag_unavailable = False
 
 
 def normalize_hf_model_id(model_name):
@@ -270,23 +272,81 @@ def load_api_doc(api, lib):
     api_str = f'Signature: {sig}\nDescriptions: {nl_descs}\nExample code: {ex_codes}'
     return api_str
 
+
+def get_api_rag_client():
+    global _api_rag_client, _api_rag_unavailable
+    if _api_rag_unavailable:
+        return None
+    if _api_rag_client is not None:
+        return _api_rag_client
+
+    try:
+        _api_rag_client = chromadb.PersistentClient(path='./api_docs_db')
+        return _api_rag_client
+    except BaseException as exc:
+        _api_rag_unavailable = True
+        print(f"WARNING: api_docs_db unavailable; API-RAG disabled for this run. reason={exc}")
+        return None
+
 def get_api_rag_docs(prompt, api, lib, src, doc_num):
+    client = get_api_rag_client()
+    if client is None:
+        return []
+
     api_name = api.split('.')[-1]
     if api_name.startswith('__'):
         api_name = api_name[2:]
     embed_fn = MyEmbeddingFunction()
-    client = chromadb.PersistentClient(path='./api_docs_db')
-    
-    collection = client.get_or_create_collection(
-        name=f'{api_name}_{lib}_{src}',
-        embedding_function=embed_fn
-    )
-    retriever_results = collection.query(
-        query_texts=[prompt],
-        n_results=doc_num,
-    )
-    doc = retriever_results["documents"][0]
-    return doc
+
+    try:
+        collection = client.get_or_create_collection(
+            name=f'{api_name}_{lib}_{src}',
+            embedding_function=embed_fn
+        )
+        retriever_results = collection.query(
+            query_texts=[prompt],
+            n_results=doc_num,
+        )
+        documents = retriever_results.get("documents", [])
+        if not documents:
+            return []
+        return documents[0] or []
+    except BaseException as exc:
+        print(f"WARNING: API-RAG retrieval failed for {api}/{lib}/{src}; falling back without these docs. reason={exc}")
+        return []
+
+
+def build_api_rag_prompt_with_fallback(basic_task_prompt, post_prompt, api, lib, baseline):
+    try:
+        if 'apidoc' in baseline:
+            doc = load_api_doc(api, lib)
+            return f'''{basic_task_prompt} Use the following API documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}\n@@@ {doc} @@@'''
+
+        if 'issues' in baseline:
+            docs = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 3)
+        elif 'sos' in baseline:
+            docs = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 3)
+        elif 'repos' in baseline:
+            docs = get_api_rag_docs(basic_task_prompt, api, lib, 'repos', 3)
+        elif 'all' in baseline:
+            docs = []
+            iss_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 1)
+            sos_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 1)
+            if iss_doc:
+                docs.append(iss_doc[0])
+            if sos_doc:
+                docs.append(sos_doc[0])
+            docs.append(load_api_doc(api, lib))
+        else:
+            docs = []
+
+        final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+        for i, d in enumerate(docs):
+            final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+        return final_task_prompt
+    except BaseException as exc:
+        print(f"WARNING: API-RAG prompt build failed for {api}/{lib}/{baseline}; continuing without API-RAG docs. reason={exc}")
+        return f'{basic_task_prompt} {post_prompt}'
     
 
 def get_basic_rag_docs(prompt, src, doc_num):
@@ -448,36 +508,13 @@ def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='hosted
             for i, d in enumerate(docs):
                 final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
         elif 'api_rag' in baseline:
-            if 'apidoc' in baseline:
-                doc = load_api_doc(api, lib)
-                final_task_prompt = f'''{basic_task_prompt} Use the following API documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}\n@@@ {doc} @@@'''
-            elif 'issues' in baseline:
-                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 3)
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-            elif 'sos' in baseline:
-                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 3)
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-            elif 'repos' in baseline:
-                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'repos', 3)
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-            elif 'all' in baseline:
-                docs = []
-                iss_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 1)
-                sos_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 1)
-                if iss_doc:
-                    docs.append(iss_doc[0])
-                if sos_doc:
-                    docs.append(sos_doc[0])
-                docs.append(load_api_doc(api, lib))
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            final_task_prompt = build_api_rag_prompt_with_fallback(
+                basic_task_prompt=basic_task_prompt,
+                post_prompt=post_prompt,
+                api=api,
+                lib=lib,
+                baseline=baseline,
+            )
         elif baseline == 'zero_shot' and 'bug_detect' not in iter:
             final_task_prompt = f'{basic_task_prompt} {post_prompt}'
         
@@ -544,36 +581,13 @@ def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='hf-local
             for i, d in enumerate(docs):
                 final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
         elif 'api_rag' in baseline:
-            if 'apidoc' in baseline:
-                doc = load_api_doc(api, lib)
-                final_task_prompt = f'''{basic_task_prompt} Use the following API documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}\n@@@ {doc} @@@'''
-            elif 'issues' in baseline:
-                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 3)
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-            elif 'sos' in baseline:
-                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 3)
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-            elif 'repos' in baseline:
-                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'repos', 3)
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-            elif 'all' in baseline:
-                docs = []
-                iss_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 1)
-                sos_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 1)
-                if iss_doc:
-                    docs.append(iss_doc[0])
-                if sos_doc:
-                    docs.append(sos_doc[0])
-                docs.append(load_api_doc(api, lib))
-                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-                for i, d in enumerate(docs):
-                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            final_task_prompt = build_api_rag_prompt_with_fallback(
+                basic_task_prompt=basic_task_prompt,
+                post_prompt=post_prompt,
+                api=api,
+                lib=lib,
+                baseline=baseline,
+            )
         elif baseline == 'zero_shot' and 'bug_detect' not in iter:
             final_task_prompt = f'{basic_task_prompt} {post_prompt}'
         
