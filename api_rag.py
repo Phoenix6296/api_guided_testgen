@@ -6,7 +6,7 @@ import numpy as np
 import json
 import os
 import sys
-import torch
+import importlib.util
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from tqdm.auto import tqdm
@@ -17,51 +17,33 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # only errors
 import logging
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 import tensorflow as tf
+import torch
 tf.get_logger().setLevel('ERROR')  # for tf2.x
 tf.autograph.set_verbosity(0)
 
-HF_MODEL_ID = os.getenv('HF_MODEL_ID', 'Qwen/Qwen2.5-7B-Instruct')
+def normalize_hf_model_name(name):
+    if not name:
+        return 'Qwen/Qwen2.5-7B'
+
+    alias_map = {
+        'qwen2.5:7b': 'Qwen/Qwen2.5-7B',
+        'qwen2.5-coder:7b': 'Qwen/Qwen2.5-7B',
+        'qwen2.5-coder:7b-instruct': 'Qwen/Qwen2.5-7B',
+    }
+
+    lowered = name.strip().lower()
+    if lowered in alias_map:
+        return alias_map[lowered]
+    return name.strip()
+
+
+HF_MODEL = normalize_hf_model_name(os.getenv('HF_MODEL', 'Qwen/Qwen2.5-7B'))
 HF_MAX_NEW_TOKENS = int(os.getenv('HF_MAX_NEW_TOKENS', '768'))
-HF_DO_SAMPLE = os.getenv('HF_DO_SAMPLE', 'false').lower() == 'true'
-HF_TEMPERATURE = float(os.getenv('HF_TEMPERATURE', '0.0'))
-HF_TOP_P = float(os.getenv('HF_TOP_P', '0.95'))
 FIXED_RAG_EXAMPLES = 3
 
-_hf_generators = {}
-_hf_tokenizers = {}
-_api_rag_client = None
-_api_rag_unavailable = False
-
-
-def normalize_hf_model_id(model_name):
-    if not model_name:
-        return 'Qwen/Qwen2.5-7B-Instruct'
-
-    aliases = {
-        'qwen2.5-coder:7b-instruct': 'Qwen/Qwen2.5-7B-Instruct',
-        'qwen2.5:7b-instruct': 'Qwen/Qwen2.5-7B-Instruct',
-        'qwen2.5-7b': 'Qwen/Qwen2.5-7B-Instruct',
-    }
-    return aliases.get(model_name, model_name)
-
-
-def get_transformers_generator(model_name=None):
-    target_model = normalize_hf_model_id(model_name or HF_MODEL_ID)
-    if target_model in _hf_generators:
-        return _hf_generators[target_model], _hf_tokenizers[target_model]
-
-    tokenizer = AutoTokenizer.from_pretrained(target_model)
-    model = AutoModelForCausalLM.from_pretrained(
-        target_model,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map='auto' if torch.cuda.is_available() else None,
-    )
-    generator = pipeline('text-generation', model=model, tokenizer=tokenizer)
-    _hf_generators[target_model] = generator
-    _hf_tokenizers[target_model] = tokenizer
-    return generator, tokenizer
-
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+hf_generator = None
+hf_tokenizer = None
 
 def get_covered(class_paths, cov_infos, api):
     # get search string depending on the case
@@ -132,28 +114,52 @@ def load_doc(lib='tf', src='issues'):
     (RuntimeError, OSError, ValueError),
     max_tries=4,
 )
-def get_completion_hf(messages, model_name=None):
-    generator, tokenizer = get_transformers_generator(model_name=model_name)
+def get_completion_local_transformers(messages, model_name=None):
+    global hf_generator
+    global hf_tokenizer
 
-    # Use the model chat template, then generate only the assistant continuation.
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    request_kwargs = {
-        'max_new_tokens': HF_MAX_NEW_TOKENS,
-        'return_full_text': False,
-    }
-    if HF_DO_SAMPLE:
-        request_kwargs['temperature'] = HF_TEMPERATURE
-        request_kwargs['top_p'] = HF_TOP_P
-        request_kwargs['do_sample'] = True
+    target_model = normalize_hf_model_name(model_name or HF_MODEL)
+    if hf_generator is None:
+        hf_tokenizer = AutoTokenizer.from_pretrained(target_model, trust_remote_code=True)
+        has_accelerate = importlib.util.find_spec('accelerate') is not None
+        model_load_kwargs = {
+            'torch_dtype': 'auto',
+            'trust_remote_code': True,
+        }
+        if has_accelerate:
+            model_load_kwargs['device_map'] = 'auto'
+
+        model = AutoModelForCausalLM.from_pretrained(target_model, **model_load_kwargs)
+        if not has_accelerate:
+            if torch.cuda.is_available():
+                model = model.to('cuda')
+            else:
+                model = model.to('cpu')
+        hf_generator = pipeline(
+            'text-generation',
+            model=model,
+            tokenizer=hf_tokenizer,
+        )
+
+    if hasattr(hf_tokenizer, 'apply_chat_template'):
+        prompt = hf_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
     else:
-        request_kwargs['do_sample'] = False
+        prompt = '\n'.join([f"{m['role']}: {m['content']}" for m in messages]) + '\nassistant:'
 
-    response = generator(prompt, **request_kwargs)
-    return response[0]['generated_text'].strip()
+    outputs = hf_generator(
+        prompt,
+        max_new_tokens=HF_MAX_NEW_TOKENS,
+        do_sample=False,
+        return_full_text=False,
+    )
+
+    if not outputs:
+        return ''
+    return outputs[0].get('generated_text', '').strip()
 
 
 REFUSAL_MARKERS = [
@@ -229,7 +235,7 @@ def generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib
         {"role": "system", "content": strict_sys_prompt},
         {"role": "user", "content": final_task_prompt}
     ]
-    res = get_completion_hf(prompt, model_name=model_name)
+    res = get_completion_local_transformers(prompt, model_name=model_name)
 
     if is_refusal_response(res):
         retry_prompt = (
@@ -241,7 +247,7 @@ def generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib
             {"role": "system", "content": strict_sys_prompt},
             {"role": "user", "content": retry_prompt},
         ]
-        res = get_completion_hf(retry_messages, model_name=model_name)
+        res = get_completion_local_transformers(retry_messages, model_name=model_name)
 
     if is_refusal_response(res):
         return build_fallback_test(api, lib)
@@ -272,81 +278,23 @@ def load_api_doc(api, lib):
     api_str = f'Signature: {sig}\nDescriptions: {nl_descs}\nExample code: {ex_codes}'
     return api_str
 
-
-def get_api_rag_client():
-    global _api_rag_client, _api_rag_unavailable
-    if _api_rag_unavailable:
-        return None
-    if _api_rag_client is not None:
-        return _api_rag_client
-
-    try:
-        _api_rag_client = chromadb.PersistentClient(path='./api_docs_db')
-        return _api_rag_client
-    except BaseException as exc:
-        _api_rag_unavailable = True
-        print(f"WARNING: api_docs_db unavailable; API-RAG disabled for this run. reason={exc}")
-        return None
-
 def get_api_rag_docs(prompt, api, lib, src, doc_num):
-    client = get_api_rag_client()
-    if client is None:
-        return []
-
     api_name = api.split('.')[-1]
     if api_name.startswith('__'):
         api_name = api_name[2:]
     embed_fn = MyEmbeddingFunction()
-
-    try:
-        collection = client.get_or_create_collection(
-            name=f'{api_name}_{lib}_{src}',
-            embedding_function=embed_fn
-        )
-        retriever_results = collection.query(
-            query_texts=[prompt],
-            n_results=doc_num,
-        )
-        documents = retriever_results.get("documents", [])
-        if not documents:
-            return []
-        return documents[0] or []
-    except BaseException as exc:
-        print(f"WARNING: API-RAG retrieval failed for {api}/{lib}/{src}; falling back without these docs. reason={exc}")
-        return []
-
-
-def build_api_rag_prompt_with_fallback(basic_task_prompt, post_prompt, api, lib, baseline):
-    try:
-        if 'apidoc' in baseline:
-            doc = load_api_doc(api, lib)
-            return f'''{basic_task_prompt} Use the following API documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}\n@@@ {doc} @@@'''
-
-        if 'issues' in baseline:
-            docs = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 3)
-        elif 'sos' in baseline:
-            docs = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 3)
-        elif 'repos' in baseline:
-            docs = get_api_rag_docs(basic_task_prompt, api, lib, 'repos', 3)
-        elif 'all' in baseline:
-            docs = []
-            iss_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 1)
-            sos_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 1)
-            if iss_doc:
-                docs.append(iss_doc[0])
-            if sos_doc:
-                docs.append(sos_doc[0])
-            docs.append(load_api_doc(api, lib))
-        else:
-            docs = []
-
-        final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
-        for i, d in enumerate(docs):
-            final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
-        return final_task_prompt
-    except BaseException as exc:
-        print(f"WARNING: API-RAG prompt build failed for {api}/{lib}/{baseline}; continuing without API-RAG docs. reason={exc}")
-        return f'{basic_task_prompt} {post_prompt}'
+    client = chromadb.PersistentClient(path='./api_docs_db')
+    
+    collection = client.get_or_create_collection(
+        name=f'{api_name}_{lib}_{src}',
+        embedding_function=embed_fn
+    )
+    retriever_results = collection.query(
+        query_texts=[prompt],
+        n_results=doc_num,
+    )
+    doc = retriever_results["documents"][0]
+    return doc
     
 
 def get_basic_rag_docs(prompt, src, doc_num):
@@ -453,7 +401,7 @@ def get_hybrid_docs(prompt, api, lib, doc_num):
     candidates = get_basic_rag_docs(prompt, 'basic_rag_all', max(30, doc_num * 10))
     return select_mmr_examples(prompt, candidates, doc_num=doc_num, mmr_lambda=0.7)
 
-def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='hosted_hf', model='hf-local', max_apis=None):
+def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_ollama', model='ollama-small', max_apis=None):
     with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
         api_list = [json.loads(x)['api'] for x in f.readlines()]
     if max_apis is not None:
@@ -508,13 +456,36 @@ def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='hosted
             for i, d in enumerate(docs):
                 final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
         elif 'api_rag' in baseline:
-            final_task_prompt = build_api_rag_prompt_with_fallback(
-                basic_task_prompt=basic_task_prompt,
-                post_prompt=post_prompt,
-                api=api,
-                lib=lib,
-                baseline=baseline,
-            )
+            if 'apidoc' in baseline:
+                doc = load_api_doc(api, lib)
+                final_task_prompt = f'''{basic_task_prompt} Use the following API documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}\n@@@ {doc} @@@'''
+            elif 'issues' in baseline:
+                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 3)
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            elif 'sos' in baseline:
+                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 3)
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            elif 'repos' in baseline:
+                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'repos', 3)
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            elif 'all' in baseline:
+                docs = []
+                iss_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 1)
+                sos_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 1)
+                if iss_doc:
+                    docs.append(iss_doc[0])
+                if sos_doc:
+                    docs.append(sos_doc[0])
+                docs.append(load_api_doc(api, lib))
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
         elif baseline == 'zero_shot' and 'bug_detect' not in iter:
             final_task_prompt = f'{basic_task_prompt} {post_prompt}'
         
@@ -526,7 +497,7 @@ def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='hosted
             f.write(final_task_prompt)
         
 
-def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='hf-local', max_apis=None):
+def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='transformers', max_apis=None):
     if baseline == 'iterative':
         with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
             classes = [x for x in f.readlines()]
@@ -581,23 +552,46 @@ def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='hf-local
             for i, d in enumerate(docs):
                 final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
         elif 'api_rag' in baseline:
-            final_task_prompt = build_api_rag_prompt_with_fallback(
-                basic_task_prompt=basic_task_prompt,
-                post_prompt=post_prompt,
-                api=api,
-                lib=lib,
-                baseline=baseline,
-            )
+            if 'apidoc' in baseline:
+                doc = load_api_doc(api, lib)
+                final_task_prompt = f'''{basic_task_prompt} Use the following API documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}\n@@@ {doc} @@@'''
+            elif 'issues' in baseline:
+                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 3)
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            elif 'sos' in baseline:
+                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 3)
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            elif 'repos' in baseline:
+                docs = get_api_rag_docs(basic_task_prompt, api, lib, 'repos', 3)
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
+            elif 'all' in baseline:
+                docs = []
+                iss_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'issues', 1)
+                sos_doc = get_api_rag_docs(basic_task_prompt, api, lib, 'sos', 1)
+                if iss_doc:
+                    docs.append(iss_doc[0])
+                if sos_doc:
+                    docs.append(sos_doc[0])
+                docs.append(load_api_doc(api, lib))
+                final_task_prompt = f'''{basic_task_prompt} Use the following documents (surrounded by @@@) to make the test case more compilable, and passable, and cover more lines. {post_prompt}'''
+                for i, d in enumerate(docs):
+                    final_task_prompt += f'\n@@@ Doc_{i+1}:\n' + d + '\n@@@'
         elif baseline == 'zero_shot' and 'bug_detect' not in iter:
             final_task_prompt = f'{basic_task_prompt} {post_prompt}'
         
         sys_prompt = f"You are a unit test suite generator for {library} library."
-        if model.startswith('hf:'):
-            model_name = model.split(':', 1)[1]
-        elif model and model != 'hf-local':
-            model_name = model
+        if model.startswith('transformers:'):
+            model_name = normalize_hf_model_name(model.split(':', 1)[1])
+        elif model == 'transformers':
+            model_name = HF_MODEL
         else:
-            model_name = HF_MODEL_ID
+            model_name = HF_MODEL
 
         res = generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib)
         
@@ -644,10 +638,8 @@ if __name__=="__main__":
         print('incorrect baseline!')
     else:
         print('Generating TCs for', lib, 'library using', baseline, 'iter', iter, 'model', fm)
-        if fm.startswith('hf:'):
-            print('Using Hugging Face model override:', fm.split(':', 1)[1])
-        elif fm and fm != 'hf-local':
-            print('Using Hugging Face model override:', fm)
-        print('Using local Transformers model:', normalize_hf_model_id(HF_MODEL_ID))
+        if not (fm == 'transformers' or fm.startswith('transformers:')):
+            print('Ignoring non-transformers model selector:', fm, '-> using local Transformers model:', HF_MODEL)
+        print('Using local Transformers model:', HF_MODEL)
         run_exp(baseline=baseline, lib=lib, doc_num=3, iter=iter, model=fm, max_apis=max_apis)
 
