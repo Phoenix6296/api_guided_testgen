@@ -34,7 +34,8 @@ def get_coverage_json(lib, baseline, iter):
     src = get_source_root(lib)
     path = f'{ROOT_PATH}/out/{iter}/exec/{baseline}/{lib}/'
     w_path = f'{ROOT_PATH}/out/{iter}/coverage/'
-    os.makedirs(w_path, exist_ok=True)
+    if not os.path.isdir(w_path):
+        raise FileNotFoundError(f'Missing required directory: {w_path}. Run init_project_structure.sh first.')
     if not src:
         print(f'Unknown library for coverage source: {lib}')
         return
