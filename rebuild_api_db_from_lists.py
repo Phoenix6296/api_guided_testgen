@@ -5,8 +5,10 @@ root = Path(__file__).resolve().parent
 data_dir = root / "data"
 api_db_data = data_dir / "api_db"
 api_db_top = root / "api_db"
-api_db_data.mkdir(parents=True, exist_ok=True)
-api_db_top.mkdir(parents=True, exist_ok=True)
+if not api_db_data.is_dir():
+    raise FileNotFoundError(f"Missing required directory: {api_db_data}. Run init_project_structure.sh first.")
+if not api_db_top.is_dir():
+    raise FileNotFoundError(f"Missing required directory: {api_db_top}. Run init_project_structure.sh first.")
 libs = ["tf", "torch", "sklearn", "xgb", "jax"]
 
 def read_lines(path: Path):

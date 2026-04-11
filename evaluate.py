@@ -112,8 +112,14 @@ def evaluate(lib='torch', baseline='basic_rag', iter='0', max_apis=None):
     # if os.path.exists(f'{ROOT_PATH}/log{iter}/{lib}_{baseline}_eval.log'):
     #     print('log already exists, so, skipping eval!')
     # #     return
-    if os.path.exists(path):
-        shutil.rmtree(path)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f'Missing required directory: {path}. Run init_project_structure.sh first.')
+    for name in os.listdir(path):
+        target = f'{path}/{name}'
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        elif os.path.isfile(target):
+            os.remove(target)
     for i, api in enumerate(tqdm(api_list, total=len(api_list), ncols=70)):
         with open(f'{ROOT_PATH}/out/{iter}/generated/{baseline}/{lib}/{api}') as f:
             generated = f.read()
@@ -138,7 +144,6 @@ def evaluate(lib='torch', baseline='basic_rag', iter='0', max_apis=None):
         # Syntax Check: if it is parsable, execute it
         else:
             file = f'{path}/{api}.py'
-            os.makedirs(path, exist_ok=True)
             if 'import' not in generated:
                 generated = add_class(lib, generated)
             elif 'import unittest' not in generated:

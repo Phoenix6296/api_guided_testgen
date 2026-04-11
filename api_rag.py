@@ -1,6 +1,4 @@
 import backoff
-from openai import OpenAI
-import openai
 import chromadb
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
@@ -8,6 +6,8 @@ import numpy as np
 import json
 import os
 import sys
+import importlib.util
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
@@ -17,19 +17,33 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # only errors
 import logging
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 import tensorflow as tf
+import torch
 tf.get_logger().setLevel('ERROR')  # for tf2.x
 tf.autograph.set_verbosity(0)
 
-OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434/v1')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen2.5-coder:7b-instruct')
-OLLAMA_TIMEOUT = float(os.getenv('OLLAMA_TIMEOUT', '120'))
+def normalize_hf_model_name(name):
+    if not name:
+        return 'Qwen/Qwen2.5-7B'
+
+    alias_map = {
+        'qwen2.5:7b': 'Qwen/Qwen2.5-7B',
+        'qwen2.5-coder:7b': 'Qwen/Qwen2.5-7B',
+        'qwen2.5-coder:7b-instruct': 'Qwen/Qwen2.5-7B',
+    }
+
+    lowered = name.strip().lower()
+    if lowered in alias_map:
+        return alias_map[lowered]
+    return name.strip()
+
+
+HF_MODEL = normalize_hf_model_name(os.getenv('HF_MODEL', 'Qwen/Qwen2.5-7B'))
+HF_MAX_NEW_TOKENS = int(os.getenv('HF_MAX_NEW_TOKENS', '768'))
 FIXED_RAG_EXAMPLES = 3
 
-ollama_client = OpenAI(
-    base_url=OLLAMA_BASE_URL,
-    api_key=os.getenv('OLLAMA_API_KEY', 'ollama')
-)
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+hf_generator = None
+hf_tokenizer = None
 
 def get_covered(class_paths, cov_infos, api):
     # get search string depending on the case
@@ -97,23 +111,55 @@ def load_doc(lib='tf', src='issues'):
 
 @backoff.on_exception(
     backoff.expo,
-    (
-        openai.APIConnectionError,
-        openai.APITimeoutError,
-        openai.RateLimitError,
-        openai.APIError,
-    ),
+    (RuntimeError, OSError, ValueError),
     max_tries=4,
 )
-def get_completion_ollama(messages, model_name=None):
-    target_model = model_name or OLLAMA_MODEL
-    response = ollama_client.chat.completions.create(
-        model=target_model,
-        messages=messages,
-        temperature=0,
-        timeout=OLLAMA_TIMEOUT,
+def get_completion_local_transformers(messages, model_name=None):
+    global hf_generator
+    global hf_tokenizer
+
+    target_model = normalize_hf_model_name(model_name or HF_MODEL)
+    if hf_generator is None:
+        hf_tokenizer = AutoTokenizer.from_pretrained(target_model, trust_remote_code=True)
+        has_accelerate = importlib.util.find_spec('accelerate') is not None
+        model_load_kwargs = {
+            'torch_dtype': 'auto',
+            'trust_remote_code': True,
+        }
+        if has_accelerate:
+            model_load_kwargs['device_map'] = 'auto'
+
+        model = AutoModelForCausalLM.from_pretrained(target_model, **model_load_kwargs)
+        if not has_accelerate:
+            if torch.cuda.is_available():
+                model = model.to('cuda')
+            else:
+                model = model.to('cpu')
+        hf_generator = pipeline(
+            'text-generation',
+            model=model,
+            tokenizer=hf_tokenizer,
+        )
+
+    if hasattr(hf_tokenizer, 'apply_chat_template'):
+        prompt = hf_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        prompt = '\n'.join([f"{m['role']}: {m['content']}" for m in messages]) + '\nassistant:'
+
+    outputs = hf_generator(
+        prompt,
+        max_new_tokens=HF_MAX_NEW_TOKENS,
+        do_sample=False,
+        return_full_text=False,
     )
-    return response.choices[0].message.content.strip()
+
+    if not outputs:
+        return ''
+    return outputs[0].get('generated_text', '').strip()
 
 
 REFUSAL_MARKERS = [
@@ -189,7 +235,7 @@ def generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib
         {"role": "system", "content": strict_sys_prompt},
         {"role": "user", "content": final_task_prompt}
     ]
-    res = get_completion_ollama(prompt, model_name=model_name)
+    res = get_completion_local_transformers(prompt, model_name=model_name)
 
     if is_refusal_response(res):
         retry_prompt = (
@@ -201,7 +247,7 @@ def generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib
             {"role": "system", "content": strict_sys_prompt},
             {"role": "user", "content": retry_prompt},
         ]
-        res = get_completion_ollama(retry_messages, model_name=model_name)
+        res = get_completion_local_transformers(retry_messages, model_name=model_name)
 
     if is_refusal_response(res):
         return build_fallback_test(api, lib)
@@ -355,7 +401,7 @@ def get_hybrid_docs(prompt, api, lib, doc_num):
     candidates = get_basic_rag_docs(prompt, 'basic_rag_all', max(30, doc_num * 10))
     return select_mmr_examples(prompt, candidates, doc_num=doc_num, mmr_lambda=0.7)
 
-def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_ollama', model='ollama-small', max_apis=None):
+def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_transformers', model='transformers', max_apis=None):
     with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
         api_list = [json.loads(x)['api'] for x in f.readlines()]
     if max_apis is not None:
@@ -446,12 +492,21 @@ def generate_prompt(baseline='basic_rag_sos', lib='xgb', doc_num=3, iter='local_
         if baseline == 'zero_shot':
             continue
             
-        os.makedirs(f'out/{iter}/prompt/{baseline}/{lib}/', exist_ok=True)
+        prompt_dir = f'out/{iter}/prompt/{baseline}/{lib}/'
+        if not os.path.isdir(prompt_dir):
+            raise FileNotFoundError(f'Missing required directory: {prompt_dir}. Run init_project_structure.sh first.')
         with open(prompt_file_path, 'w') as f:
             f.write(final_task_prompt)
         
 
-def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='ollama-small', max_apis=None):
+def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='transformers', max_apis=None):
+    generated_dir = f'out/{iter}/generated/{baseline}/{lib}'
+    prompt_dir = f'out/{iter}/prompt/{baseline}/{lib}'
+    if not os.path.isdir(generated_dir):
+        raise FileNotFoundError(f'Missing required directory: {generated_dir}. Run init_project_structure.sh first.')
+    if baseline != 'zero_shot' and not os.path.isdir(prompt_dir):
+        raise FileNotFoundError(f'Missing required directory: {prompt_dir}. Run init_project_structure.sh first.')
+
     if baseline == 'iterative':
         with open(f'data/api_db/api_class_over_10_{lib}.jsonl') as f:
             classes = [x for x in f.readlines()]
@@ -540,19 +595,19 @@ def run_exp(baseline='basic_rag', lib='tf', doc_num=3, iter='0', model='ollama-s
             final_task_prompt = f'{basic_task_prompt} {post_prompt}'
         
         sys_prompt = f"You are a unit test suite generator for {library} library."
-        if model.startswith('ollama:'):
-            model_name = model.split(':', 1)[1]
+        if model.startswith('transformers:'):
+            model_name = normalize_hf_model_name(model.split(':', 1)[1])
+        elif model == 'transformers':
+            model_name = HF_MODEL
         else:
-            model_name = OLLAMA_MODEL
+            model_name = HF_MODEL
 
         res = generate_test_with_retry(sys_prompt, final_task_prompt, model_name, api, lib)
         
-        os.makedirs(f'out/{iter}/generated/{baseline}/{lib}/', exist_ok=True)
         with open(f'out/{iter}/generated/{baseline}/{lib}/{api}', 'w') as f:
             f.write(res)
         if baseline == 'zero_shot':
             continue
-        os.makedirs(f'out/{iter}/prompt/{baseline}/{lib}/', exist_ok=True)
         with open(f'out/{iter}/prompt/{baseline}/{lib}/{api}', 'w') as f:
             f.write(final_task_prompt)
         
@@ -567,7 +622,8 @@ if __name__=="__main__":
     if len(sys.argv) >= 6:
         max_apis = int(sys.argv[5])
     
-    os.makedirs(f'log/{iter}', exist_ok=True)
+    if not os.path.isdir(f'log/{iter}'):
+        raise FileNotFoundError(f'Missing required directory: log/{iter}. Run init_project_structure.sh first.')
 
     # generate_prompt(baseline=baseline, lib=lib, doc_num=3, iter=iter, model=fm)
     
@@ -590,8 +646,8 @@ if __name__=="__main__":
         print('incorrect baseline!')
     else:
         print('Generating TCs for', lib, 'library using', baseline, 'iter', iter, 'model', fm)
-        if not fm.startswith('ollama'):
-            print('Ignoring non-local model selector:', fm, '-> using local Ollama model:', OLLAMA_MODEL)
-        print('Using local Ollama endpoint:', OLLAMA_BASE_URL, 'model:', OLLAMA_MODEL)
+        if not (fm == 'transformers' or fm.startswith('transformers:')):
+            print('Ignoring non-transformers model selector:', fm, '-> using local Transformers model:', HF_MODEL)
+        print('Using local Transformers model:', HF_MODEL)
         run_exp(baseline=baseline, lib=lib, doc_num=3, iter=iter, model=fm, max_apis=max_apis)
 
