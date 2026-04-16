@@ -42,7 +42,7 @@ else
   ITER="$LLM_NAME"
 fi
 
-LIBS=(tf torch sklearn xgb jax)
+LIBS=(torch sklearn xgb jax)
 METHODS=(
   similarity
   diversity

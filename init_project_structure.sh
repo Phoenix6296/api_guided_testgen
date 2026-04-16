@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-LIBS=(tf torch sklearn xgb jax)
+LIBS=(torch sklearn xgb jax)
 BASELINES=(
   zero_shot
   similarity
