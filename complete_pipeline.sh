@@ -42,7 +42,7 @@ else
   ITER="$LLM_NAME"
 fi
 
-LIBS=(sklearn xgb jax)
+LIBS=(sklearn)
 METHODS=(
   similarity
   diversity

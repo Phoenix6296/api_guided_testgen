@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-LIBS=(sklearn xgb jax)
+LIBS=(sklearn)
 BASELINES=(
   zero_shot
   similarity
