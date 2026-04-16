@@ -5,20 +5,11 @@ cd "$(dirname "$0")"
 
 LIBS=(tf torch sklearn xgb jax)
 BASELINES=(
-  basic_rag_all
-  basic_rag_apidoc
-  basic_rag_sos
-  basic_rag_issues
-  basic_rag_repos
+  zero_shot
   similarity
   diversity
   hybrid
-  zero_shot
-  api_rag_all
-  api_rag_apidoc
-  api_rag_issues
-  api_rag_sos
-  api_rag_repos
+  basic_rag_all
 )
 
 if [ -f ".env" ]; then
